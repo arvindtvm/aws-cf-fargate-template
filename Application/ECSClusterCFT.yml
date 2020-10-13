@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy ECS Cluster and Related Artifacts including Container related SG's and the ALB
+#aws cloudformation create-stack --stack-name abECSStack --template-body file://../Application/ECSClusterCFT.yml
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: abCFTEnvironment
+  StackName:
+    Type: String
+    Default: abCFNetworkStack
+    Description: The name of the networking stack that
+      these resources are put into.
+  ServiceName:
+    Type: String
+    Default: ECS-Service-abCFNetworkStack
+    Description: A human-readable name for the service.
+  HealthCheckPath:
+    Type: String
+    Default: /currency-exchange/from/AUD/to/INR #;) 
+    Description: Path to perform the healthcheck on each instance.
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 60
+    Description: Number of seconds to wait between each health check.
+  ImageUrl:
+    Type: String
+    Default: 450176962599.dkr.ecr.ap-southeast-2.amazonaws.com/ab-ces-rest-docker:latest
+    Description: The url of a docker image that will handle incoming traffic.
+  ContainerPort:
+    Type: Number
+    Default: 8000
+    Description: The port number the application inside the docker container
+      is binding to.
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to give the container. 1024 is 1 CPU.
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How much memory in megabytes to give the container.
+  Path:
+    Type: String
+    Default: "*"
+    Description: A path on the public load balancer that this service
+      should be connected to.
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: How many copies of the service task to run.
+
+Resources:
+
+  PublicLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Join [':', [!Ref 'EnvironmentName', 'VpcId']]
+      SecurityGroupIngress:
+        # Allow access to ALB from anywhere on the internet
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets:
+        # The load balancer is placed into the public subnets, so that traffic
+        # from the internet can reach the load balancer directly via the internet gateway
+        - Fn::ImportValue:
+            !Join [':', [!Ref 'EnvironmentName', 'PublicSubnetA']]
+        - Fn::ImportValue:
+            !Join [':', [!Ref 'EnvironmentName', 'PublicSubnetB']]
+      SecurityGroups: [!Ref 'PublicLoadBalancerSecurityGroup']
+
+  TargetGroupPlaceholder:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: !Ref 'HealthCheckIntervalSeconds'
+      HealthCheckPath: !Ref 'HealthCheckPath'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      TargetType: ip
+      Name: !Ref 'ServiceName'
+      Port: !Ref 'ContainerPort'
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue:
+          !Join [':', [!Ref 'EnvironmentName', 'VpcId']]
+
+  PublicLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - PublicLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'TargetGroupPlaceholder'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PublicLoadBalancer'
+      Port: 80
+      Protocol: HTTP
+
+  # ECS Resources
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: 'ab-ecs-cluster' #<<TODO>> Make this dynamic
+
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: 'ab-ecs-container-SecurityGroup' 
+      GroupDescription: Access to the Fargate containers
+      VpcId: 
+        Fn::ImportValue: 
+          !Join [':', [!Ref 'EnvironmentName', 'VpcId']]
+ 
+  ECSSecurityGroupIngressFromPublicALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the public ALB
+      GroupId: !Ref 'ContainerSecurityGroup'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'PublicLoadBalancerSecurityGroup'
+
+  ECSSecurityGroupIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId: !Ref 'ContainerSecurityGroup'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'ContainerSecurityGroup'
+
+
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref 'ServiceName'
+      RetentionInDays: 1
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref 'ServiceName'
+      Cpu: !Ref 'ContainerCpu'
+      Memory: !Ref 'ContainerMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          !Join [':', [!Ref 'EnvironmentName', 'ECSTaskExecutionRole']]
+      ContainerDefinitions:
+        - Name: !Ref 'ServiceName'
+          Cpu: !Ref 'ContainerCpu'
+          Memory: !Ref 'ContainerMemory'
+          Image: !Ref 'ImageUrl'
+          PortMappings:
+            - ContainerPort: !Ref 'ContainerPort'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group: !Ref 'ServiceName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref 'ServiceName'
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: PublicLoadBalancer
+    Properties:
+      ServiceName: !Ref 'ServiceName'
+      Cluster: !Ref 'ECSCluster' 
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !Ref 'DesiredCount'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref 'ContainerSecurityGroup'
+          Subnets:
+            - Fn::ImportValue:
+                !Join [':', [!Ref 'EnvironmentName', 'PublicSubnetA']]
+            - Fn::ImportValue:
+                !Join [':', [!Ref 'EnvironmentName', 'PublicSubnetB']]
+      TaskDefinition: !Ref 'TaskDefinition'
+      LoadBalancers:
+        - ContainerName: !Ref 'ServiceName'
+          ContainerPort: !Ref 'ContainerPort'
+          TargetGroupArn: !Ref 'TargetGroupPlaceholder'
